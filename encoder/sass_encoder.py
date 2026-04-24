@@ -700,11 +700,13 @@ def enc_utmacctl_pf(p: ParsedInsn) -> int:
     return _apply_pred(w, p.pred)
 
 
-@register("ATOMS.OR")
-def enc_atoms_or(p: ParsedInsn) -> int:
-    """ATOMS.OR Rd, [addr], Rb — shared-memory atomic OR."""
+def _atoms_logical_impl(p: ParsedInsn, *, subop: int) -> int:
+    """ATOMS.{AND,OR,XOR} Rd, [addr], Rb — shared-memory atomic bitwise op.
+
+    Subop bits 87..88: AND=0b01, OR=0b10, XOR=0b11.
+    """
     if len(p.operands) != 3:
-        raise UnsupportedInstruction(f"ATOMS.OR arity {len(p.operands)}")
+        raise UnsupportedInstruction(f"ATOMS arity {len(p.operands)}")
     rd, _ = parse_reg(p.operands[0])
     ra, ur, off = _parse_syncs_addr(p.operands[1])
     rb, _ = parse_reg(p.operands[2])
@@ -712,18 +714,32 @@ def enc_atoms_or(p: ParsedInsn) -> int:
     w = set_bits(w, 16, 8, rd)
     w = set_bits(w, 32, 8, rb)
     w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 87, 2, subop)
+    w = set_bits(w, 89, 1, 1)                   # fixed tail flag
     if ur != 0xff:
-        # UR-base: opcode 0x798c, URa at bits 64-71, bit 91 set.
         w = set_bits(w, 0, 16, 0x798c)
         w = set_bits(w, 24, 8, ra)
         w = set_bits(w, 64, 8, ur)
-        w = set_bits(w, 88, 8, 0x0b)
+        w = set_bits(w, 91, 1, 1)
     else:
-        # R-base: opcode 0x738c.
         w = set_bits(w, 0, 16, 0x738c)
         w = set_bits(w, 24, 8, ra)
-        w = set_bits(w, 88, 8, 0x03)
     return _apply_pred(w, p.pred)
+
+
+@register("ATOMS.AND")
+def enc_atoms_and(p: ParsedInsn) -> int:
+    return _atoms_logical_impl(p, subop=0b01)
+
+
+@register("ATOMS.OR")
+def enc_atoms_or(p: ParsedInsn) -> int:
+    return _atoms_logical_impl(p, subop=0b10)
+
+
+@register("ATOMS.XOR")
+def enc_atoms_xor(p: ParsedInsn) -> int:
+    return _atoms_logical_impl(p, subop=0b11)
 
 
 @register("STSM.16.MT88.4")
@@ -1297,6 +1313,31 @@ def enc_ldc_64(p: ParsedInsn) -> int:
     return _ldc_family(p, opcode=0x7b82, dtype=0x0a, shift=6, is_ureg_dst=False)
 
 
+@register("LDC.U8")
+def enc_ldc_u8(p: ParsedInsn) -> int:
+    return _ldc_family(p, opcode=0x7b82, dtype=0x00, shift=6, is_ureg_dst=False)
+
+
+@register("LDC.S8")
+def enc_ldc_s8(p: ParsedInsn) -> int:
+    return _ldc_family(p, opcode=0x7b82, dtype=0x02, shift=6, is_ureg_dst=False)
+
+
+@register("LDC.U16")
+def enc_ldc_u16(p: ParsedInsn) -> int:
+    return _ldc_family(p, opcode=0x7b82, dtype=0x04, shift=6, is_ureg_dst=False)
+
+
+@register("LDC.S16")
+def enc_ldc_s16(p: ParsedInsn) -> int:
+    return _ldc_family(p, opcode=0x7b82, dtype=0x06, shift=6, is_ureg_dst=False)
+
+
+@register("LDC.128")
+def enc_ldc_128(p: ParsedInsn) -> int:
+    return _ldc_family(p, opcode=0x7b82, dtype=0x0c, shift=6, is_ureg_dst=False)
+
+
 @register("LDCU")
 def enc_ldcu(p: ParsedInsn) -> int:
     return _ldc_family(p, opcode=0x77ac, dtype=0x08, shift=5, is_ureg_dst=True)
@@ -1349,29 +1390,211 @@ def enc_cs2r_32(p: ParsedInsn) -> int:
     return _apply_pred(w, p.pred)
 
 
-@register("I2F.RP")
-def enc_i2f_rp(p: ParsedInsn) -> int:
-    """I2F.RP Rd, URb  — int-to-float with round-to-positive-inf."""
+def _i2f_impl(p: ParsedInsn, *, byte9: int, byte10: int,
+              opcode_r: int = 0x7306, opcode_ur: int = 0x7d06) -> int:
+    """Int-to-float conversion with a selectable byte-9/byte-10 flag pair.
+
+    byte9 holds input type + rounding-mode flags; byte10 holds the output
+    width field. The 32/16-bit input family uses opcode 0x7306/0x7d06 and
+    the 64-bit input family uses 0x7312/0x7d12.
+    """
     if len(p.operands) != 2:
-        raise UnsupportedInstruction(f"I2F.RP arity {len(p.operands)}")
+        raise UnsupportedInstruction(f"{p.mnemonic} arity {len(p.operands)}")
     rd, _ = parse_reg(p.operands[0])
     src = p.operands[1]
     w = 0
     w = set_bits(w, 16, 8, rd)
-    w = set_bits(w, 72, 8, 0x94)
-    w = set_bits(w, 80, 8, 0x20)
-    if src.startswith("UR"):
+    w = set_bits(w, 72, 8, byte9)
+    w = set_bits(w, 80, 8, byte10)
+    if src.startswith("UR") or src.replace(".reuse", "").strip() == "URZ":
         urb, _ = parse_ureg(src)
-        w = set_bits(w, 0, 16, 0x7d06)
+        w = set_bits(w, 0, 16, opcode_ur)
         w = set_bits(w, 32, 8, urb)
         w = set_bits(w, 91, 1, 1)
     elif src.startswith("R") or src == "RZ":
         rb, _ = parse_reg(src)
-        w = set_bits(w, 0, 16, 0x7306)
+        w = set_bits(w, 0, 16, opcode_r)
         w = set_bits(w, 32, 8, rb)
     else:
-        raise UnsupportedInstruction(f"I2F.RP src {src!r}")
+        raise UnsupportedInstruction(f"{p.mnemonic} src {src!r}")
     return _apply_pred(w, p.pred)
+
+
+@register("I2F.RP")
+def enc_i2f_rp(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x94, byte10=0x20)
+
+
+@register("I2F.U32.RP")
+def enc_i2f_u32_rp(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x90, byte10=0x20)
+
+
+@register("I2F.U16")
+def enc_i2f_u16(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x10, byte10=0x10)
+
+
+@register("I2F.S64")
+def enc_i2f_s64(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x14, byte10=0x30,
+                     opcode_r=0x7312, opcode_ur=0x7d12)
+
+
+@register("I2F.U64.RP")
+def enc_i2f_u64_rp(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x90, byte10=0x30,
+                     opcode_r=0x7312, opcode_ur=0x7d12)
+
+
+@register("I2F.F64")
+def enc_i2f_f64(p: ParsedInsn) -> int:
+    return _i2f_impl(p, byte9=0x1c, byte10=0x20,
+                     opcode_r=0x7312, opcode_ur=0x7d12)
+
+
+@register("REDUX")
+def enc_redux(p: ParsedInsn) -> int:
+    """REDUX URd, Ra — warp-shuffle reduction into a uniform register."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"REDUX arity {len(p.operands)}")
+    urd, _ = parse_ureg(p.operands[0])
+    ra, _ = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73c4)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 24, 8, ra)
+    return _apply_pred(w, p.pred)
+
+
+@register("FCHK")
+def enc_fchk(p: ParsedInsn) -> int:
+    """FCHK Pd, Ra, Rb — FP finite-check, sets Pd if Ra/Rb are both finite."""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction(f"FCHK arity {len(p.operands)}")
+    pd = _parse_pred_dst(p.operands[0])
+    ra, _ = parse_reg(p.operands[1])
+    rb, _ = parse_reg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7302)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 32, 8, rb)
+    w = set_bits(w, 81, 3, pd)
+    return _apply_pred(w, p.pred)
+
+
+def _vote_impl(p: ParsedInsn, *, subop: int) -> int:
+    """VOTE.<subop> Rd, Pd_vote, Ps  or  VOTE.<subop> Pd_vote, Ps."""
+    if len(p.operands) == 3:
+        rd, _ = parse_reg(p.operands[0])
+        pd_vote = _parse_pred_dst(p.operands[1])
+        ps_idx, ps_neg = _parse_pred_src(p.operands[2])
+    elif len(p.operands) == 2:
+        rd = 0xff                               # no-Rd form: RZ in the Rd slot
+        pd_vote = _parse_pred_dst(p.operands[0])
+        ps_idx, ps_neg = _parse_pred_src(p.operands[1])
+    else:
+        raise UnsupportedInstruction(f"VOTE arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x7806)
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 72, 8, subop)
+    w = set_bits(w, 81, 3, pd_vote)
+    w = set_bits(w, 87, 3, ps_idx)
+    w = set_bits(w, 90, 1, ps_neg)
+    return _apply_pred(w, p.pred)
+
+
+@register("VOTE.ANY")
+def enc_vote_any(p: ParsedInsn) -> int:
+    return _vote_impl(p, subop=0x01)
+
+
+@register("VOTE.ALL")
+def enc_vote_all(p: ParsedInsn) -> int:
+    return _vote_impl(p, subop=0x00)
+
+
+@register("VOTE.UNI")
+def enc_vote_uni(p: ParsedInsn) -> int:
+    return _vote_impl(p, subop=0x02)
+
+
+@register("USETMAXREG.DEALLOC.CTAPOOL")
+def enc_usetmaxreg_dealloc_ctapool(p: ParsedInsn) -> int:
+    """USETMAXREG.DEALLOC.CTAPOOL imm — release register-pool lanes back to CTA."""
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"USETMAXREG arity {len(p.operands)}")
+    imm = parse_imm(p.operands[0]) & 0xff
+    w = 0
+    w = set_bits(w, 0, 16, 0x79c8)
+    w = set_bits(w, 32, 8, imm)
+    w = set_bits(w, 72, 8, 0x05)
+    w = set_bits(w, 80, 8, 0x0e)
+    w = set_bits(w, 88, 8, 0x08)
+    return _apply_pred(w, p.pred)
+
+
+@register("R2UR.BROADCAST")
+def enc_r2ur_broadcast(p: ParsedInsn) -> int:
+    """R2UR.BROADCAST URd, Ra — broadcast lane-0 value into a uniform reg."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"R2UR.BROADCAST arity {len(p.operands)}")
+    urd, _ = parse_ureg(p.operands[0])
+    ra, ra_reuse = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x72ca)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 80, 8, 0x8e)
+    if ra_reuse:
+        w = set_bits(w, 122, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+def _i2fp_impl(p: ParsedInsn, *, byte9: int, byte10: int) -> int:
+    """I2FP — the 'packed' int→float form (different opcode family from I2F).
+
+    Opcode 0x7245 for Ra input, 0x7c45 for UR input (bit 91 set).
+    """
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"{p.mnemonic} arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    src = p.operands[1]
+    w = 0
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 72, 8, byte9)
+    w = set_bits(w, 80, 8, byte10)
+    if src.startswith("UR") or src.replace(".reuse", "").strip() == "URZ":
+        urb, _ = parse_ureg(src)
+        w = set_bits(w, 0, 16, 0x7c45)
+        w = set_bits(w, 32, 8, urb)
+        w = set_bits(w, 91, 1, 1)
+    else:
+        rb, _ = parse_reg(src)
+        w = set_bits(w, 0, 16, 0x7245)
+        w = set_bits(w, 32, 8, rb)
+    return _apply_pred(w, p.pred)
+
+
+@register("I2FP.F32.S32")
+def enc_i2fp_f32_s32(p: ParsedInsn) -> int:
+    return _i2fp_impl(p, byte9=0x14, byte10=0x20)
+
+
+@register("I2FP.F32.U32")
+def enc_i2fp_f32_u32(p: ParsedInsn) -> int:
+    return _i2fp_impl(p, byte9=0x10, byte10=0x20)
+
+
+@register("I2FP.F32.U32.RZ")
+def enc_i2fp_f32_u32_rz(p: ParsedInsn) -> int:
+    return _i2fp_impl(p, byte9=0xd0, byte10=0x20)
+
+
+@register("I2FP.F32.S32.RZ")
+def enc_i2fp_f32_s32_rz(p: ParsedInsn) -> int:
+    return _i2fp_impl(p, byte9=0xd4, byte10=0x20)
 
 
 @register("FFMA.RM")
@@ -1609,7 +1832,7 @@ def enc_uiadd3(p: ParsedInsn) -> int:
     urc, urc_reuse = parse_ureg(p.operands[5])
 
     ura_neg = False
-    if a_tok.startswith("-"):
+    if a_tok.startswith("-") or a_tok.startswith("~"):
         ura_neg = True
         a_tok = a_tok[1:].strip()
     ura, ura_reuse = parse_ureg(a_tok)
@@ -1627,18 +1850,18 @@ def enc_uiadd3(p: ParsedInsn) -> int:
     w = set_bits(w, 88, 3, 7)                   # Ps = UPT (fixed)
     w = set_bits(w, 91, 1, 1)                   # UR-form flag, always on
 
-    # Detect UR operand (possibly negated) vs immediate. A `-` prefix on a
-    # UR operand means arithmetic negation; on an immediate it's part of the
-    # literal.
-    b_stripped = b_tok[1:].strip() if b_tok.startswith("-") else b_tok
+    # Detect UR operand (possibly negated or bitwise-negated) vs immediate.
+    # `-`/`~` on a UR operand sets the B-negate flag at bit 63; on an immediate
+    # the sign stays in the literal.
+    b_has_neg = b_tok.startswith("-") or b_tok.startswith("~")
+    b_stripped = b_tok[1:].strip() if b_has_neg else b_tok
     is_ureg = b_stripped.startswith("UR") or b_stripped.replace(".reuse", "").strip() == "URZ"
 
     if is_ureg:
-        b_neg = b_tok.startswith("-")
         urb, urb_reuse = parse_ureg(b_stripped)
         w = set_bits(w, 0, 16, 0x7290)
         w = set_bits(w, 32, 8, urb)
-        if b_neg:
+        if b_has_neg:
             w = set_bits(w, 63, 1, 1)
     else:
         imm = parse_imm(b_tok) & 0xffffffff
@@ -1906,6 +2129,13 @@ def enc_fadd(p: ParsedInsn) -> int:
     return _apply_pred(w, p.pred)
 
 
+@register("FADD.FTZ")
+def enc_fadd_ftz(p: ParsedInsn) -> int:
+    """FADD.FTZ — identical to FADD plus the flush-to-zero flag at bit 80."""
+    w = enc_fadd(p)
+    return w | (1 << 80)
+
+
 @register("FSEL")
 def enc_fsel(p: ParsedInsn) -> int:
     """FSEL Rd, Ra, {Rb|URb|float-imm}, Ps"""
@@ -1948,25 +2178,37 @@ FSETP_CMP_OP = {"F": 0, "LT": 1, "EQ": 2, "LE": 3, "GT": 4, "NE": 5, "GE": 6, "T
                 "NUM": 8, "LTU": 9, "EQU": 10, "LEU": 11, "GTU": 12, "NEU": 13, "GEU": 14}
 
 
-def _fsetp_impl(p: ParsedInsn, cmp_op: int, comb: str) -> int:
-    """FSETP.<CMP>.<COMB> Pd1, Pd2, Ra, {Rb|URb|float-imm}, Ps"""
+def _fsetp_impl(p: ParsedInsn, cmp_op: int, comb: str, ftz: bool = False) -> int:
+    """FSETP[.FTZ].<CMP>.<COMB> Pd1, Pd2, [|]Ra[|], {Rb|URb|float-imm}, Ps"""
     if len(p.operands) != 5:
         raise UnsupportedInstruction(f"FSETP arity {len(p.operands)}")
     pd1 = _parse_pred_dst(p.operands[0])
     pd2 = _parse_pred_dst(p.operands[1])
-    ra, ra_reuse = parse_reg(p.operands[2])
+    a_tok = p.operands[2].strip()
+    ra_abs = a_tok.startswith("|")
+    if ra_abs:
+        # |Rn|[.reuse] — strip the surrounding bars, keep any trailing modifiers.
+        end = a_tok.index("|", 1)
+        a_tok = a_tok[1:end] + a_tok[end + 1:]
+    ra, ra_reuse = parse_reg(a_tok)
     b_tok = p.operands[3]
     ps_idx, ps_neg = _parse_pred_src(p.operands[4])
 
     w = 0
     w = set_bits(w, 24, 8, ra)
-    # byte 9 bits 76..79 = cmp_op (4-bit, supports GEU/NEU etc).
+    # byte 9 bits 76..79 = cmp_op; bit 74 = OR-combine.
     byte9 = ((cmp_op & 0xf) << 4) | (4 if comb == "OR" else 0)
     w = set_bits(w, 72, 8, byte9)
     w = set_bits(w, 81, 3, pd1)
     w = set_bits(w, 84, 3, pd2)
     w = set_bits(w, 87, 3, ps_idx)
     w = set_bits(w, 90, 1, ps_neg)
+    if ra_abs:
+        # |Ra| absolute-value flag at bit 73.
+        w = set_bits(w, 73, 1, 1)
+    if ftz:
+        # .FTZ (flush-to-zero) flag at bit 80, matching FADD.FTZ.
+        w = set_bits(w, 80, 1, 1)
 
     if b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ":
         urb, rb_reuse = parse_ureg(b_tok)
@@ -1994,6 +2236,8 @@ for _cmp, _code in FSETP_CMP_OP.items():
     for _comb in ("AND", "OR"):
         _name = f"FSETP.{_cmp}.{_comb}"
         _TABLE[_name] = (lambda p, ctx=None, _co=_code, _cb=_comb: _fsetp_impl(p, _co, _cb))
+        _ftz_name = f"FSETP.{_cmp}.FTZ.{_comb}"
+        _TABLE[_ftz_name] = (lambda p, ctx=None, _co=_code, _cb=_comb: _fsetp_impl(p, _co, _cb, ftz=True))
 
 
 def _parse_f32x2_swiz(tok: str) -> tuple[str, str, bool]:
@@ -2058,7 +2302,8 @@ def enc_fadd2(p: ParsedInsn) -> int:
     if b_swiz == "F32":
         w = set_bits(w, 85, 1, 1)
     if ra_reuse: w = set_bits(w, 122, 1, 1)
-    if rb_reuse: w = set_bits(w, 123, 1, 1)
+    # FADD2 is 2-source: B-reuse uses the C-reuse slot (bit 124).
+    if rb_reuse: w = set_bits(w, 124, 1, 1)
     return _apply_pred(w, p.pred)
 
 
@@ -2088,10 +2333,11 @@ def enc_ffma2(p: ParsedInsn) -> int:
         w = set_bits(w, 32, 8, rb)
     if a_swiz == "F32":
         w = set_bits(w, 82, 1, 1)
+    # FFMA2: Rb.F32 -> bit 88, Rc.F32 -> bit 85 (opposite from FADD2).
     if b_swiz == "F32":
-        w = set_bits(w, 85, 1, 1)
-    if c_swiz == "F32":
         w = set_bits(w, 88, 1, 1)
+    if c_swiz == "F32":
+        w = set_bits(w, 85, 1, 1)
     if ra_reuse: w = set_bits(w, 122, 1, 1)
     if rb_reuse: w = set_bits(w, 123, 1, 1)
     if rc_reuse: w = set_bits(w, 124, 1, 1)
@@ -2212,25 +2458,44 @@ def enc_ffma(p: ParsedInsn) -> int:
         rc_neg = c_tok.startswith("-")
         if rc_neg:
             c_tok = c_tok[1:].strip()
-        rc, rc_reuse = parse_reg(c_tok)
-        w = set_bits(w, 64, 8, rc)
-        if rc_neg:
-            # -Rc negate flag at byte 9 bit 75.
-            w = set_bits(w, 75, 1, 1)
-        if b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ":
-            urb, rb_reuse = parse_ureg(b_tok)
-            w = set_bits(w, 0, 16, 0x7c23)
-            w = set_bits(w, 32, 8, urb)
-            w = set_bits(w, 91, 1, 1)
-        elif b_tok.startswith("R") or b_tok.replace(".reuse", "").strip() == "RZ":
+        rb_neg = b_tok.startswith("-")
+        if rb_neg:
+            b_tok = b_tok[1:].strip()
+        # Rc may be a uniform register (URc-at-C form, opcode 0x7e23).
+        if c_tok.startswith("UR") or c_tok.replace(".reuse", "").strip() == "URZ":
+            urc, rc_reuse = parse_ureg(c_tok)
             rb, rb_reuse = parse_reg(b_tok)
-            w = set_bits(w, 0, 16, 0x7223)
-            w = set_bits(w, 32, 8, rb)
+            w = set_bits(w, 0, 16, 0x7e23)
+            w = set_bits(w, 32, 8, urc)
+            w = set_bits(w, 64, 8, rb)
+            w = set_bits(w, 91, 1, 1)
+            if rb_neg:
+                w = set_bits(w, 72, 1, 1)
+            if rc_neg:
+                w = set_bits(w, 75, 1, 1)
         else:
-            imm = _parse_float_imm(b_tok)
-            w = set_bits(w, 0, 16, 0x7823)
-            w = set_bits(w, 32, 32, imm)
-            rb_reuse = False
+            rc, rc_reuse = parse_reg(c_tok)
+            w = set_bits(w, 64, 8, rc)
+            if rc_neg:
+                # -Rc negate flag at byte 9 bit 75.
+                w = set_bits(w, 75, 1, 1)
+            if b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ":
+                urb, rb_reuse = parse_ureg(b_tok)
+                w = set_bits(w, 0, 16, 0x7c23)
+                w = set_bits(w, 32, 8, urb)
+                w = set_bits(w, 91, 1, 1)
+            elif b_tok.startswith("R") or b_tok.replace(".reuse", "").strip() == "RZ":
+                rb, rb_reuse = parse_reg(b_tok)
+                w = set_bits(w, 0, 16, 0x7223)
+                w = set_bits(w, 32, 8, rb)
+            else:
+                imm = _parse_float_imm(b_tok)
+                w = set_bits(w, 0, 16, 0x7823)
+                w = set_bits(w, 32, 32, imm)
+                rb_reuse = False
+            if rb_neg:
+                # -Rb negate flag at bit 63 (same slot FADD uses for -Rb).
+                w = set_bits(w, 63, 1, 1)
 
     if ra_reuse:
         w = set_bits(w, 122, 1, 1)
@@ -2380,6 +2645,31 @@ for _suf, _dt in GLOBAL_DTYPE.items():
     _TABLE[_name] = (lambda p, ctx=None, _d=_dt: _stg_impl(p, _d))
 
 
+def _st_e_impl(p: ParsedInsn, dtype: int) -> int:
+    """ST.E[.size] desc[URd][Rbase.64], Rdata — same shape as STG.E, opcode 0x7985."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"ST.E arity {len(p.operands)}")
+    urd_tok, base_tok, off = _parse_desc_mem(p.operands[0])
+    base_reg = base_tok.split(".")[0]
+    ra, _ = parse_reg(base_reg)
+    urd, _ = parse_ureg(urd_tok)
+    rb, _ = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7985)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 32, 8, rb)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 64, 8, urd)
+    w = set_bits(w, 72, 8, dtype)
+    w = set_bits(w, 80, 16, 0x0c10)
+    return _apply_pred(w, p.pred)
+
+
+for _suf, _dt in GLOBAL_DTYPE.items():
+    _name = f"ST.E.{_suf}" if _suf else "ST.E"
+    _TABLE[_name] = (lambda p, ctx=None, _d=_dt: _st_e_impl(p, _d))
+
+
 def _ldg_impl(p: ParsedInsn, dtype: int) -> int:
     if len(p.operands) != 2:
         raise UnsupportedInstruction(f"LDG arity {len(p.operands)}")
@@ -2418,28 +2708,24 @@ SHARED_DTYPE = {
 
 
 def _lds_impl(p: ParsedInsn, dtype: int) -> int:
+    """LDS[.dtype] Rd, [Rbase|URbase|Rbase+URa+imm]"""
     if len(p.operands) != 2:
         raise UnsupportedInstruction(f"LDS arity {len(p.operands)}")
     rd, _ = parse_reg(p.operands[0])
-    base, off = _parse_mem(p.operands[1])
+    ra, ur, off = _parse_syncs_addr(p.operands[1])
 
     w = 0
     w = set_bits(w, 0, 16, 0x7984)
     w = set_bits(w, 16, 8, rd)
     w = set_bits(w, 72, 8, dtype)
-
-    if base.startswith("UR"):
-        urb, _ = parse_ureg(base)
-        w = set_bits(w, 24, 8, 0xff)
-        w = set_bits(w, 32, 8, urb)
-        w = set_bits(w, 91, 1, 1)
-    elif base.startswith("R"):
-        rb, _ = parse_reg(base)
-        w = set_bits(w, 24, 8, rb)
-    else:
-        raise UnsupportedInstruction(f"LDS base {base!r}")
-
+    w = set_bits(w, 24, 8, ra)
     w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+
+    if ur != 0xff:
+        # Any UR in the address selects the UR-combined form (bit 91 set,
+        # UR index at bits 32..39).
+        w = set_bits(w, 32, 8, ur)
+        w = set_bits(w, 91, 1, 1)
     return _apply_pred(w, p.pred)
 
 
@@ -2566,6 +2852,142 @@ def enc_f2fp_e4m3_unpack_b(p: ParsedInsn) -> int:
 @register("F2FP.F16.E5M2.UNPACK_B")
 def enc_f2fp_e5m2_unpack_b(p: ParsedInsn) -> int:
     return _f2fp_unpack_b(p, byte9=0x04)
+
+
+def _peel_hfp_swiz(tok: str) -> tuple[str, str, bool, bool]:
+    """Parse "[-]Rn[.reuse][.H0_H0|.H1_H1]" or the UR analog.
+
+    Returns (bare_token, swiz, reuse, neg) where swiz is "", "H0_H0", or "H1_H1".
+    """
+    neg = tok.startswith("-")
+    if neg:
+        tok = tok[1:].strip()
+    swiz = ""
+    for s in (".H0_H0", ".H1_H1"):
+        if tok.endswith(s):
+            swiz = s[1:]
+            tok = tok[: -len(s)]
+            break
+    reuse = ".reuse" in tok
+    if reuse:
+        tok = tok.replace(".reuse", "")
+    return tok, swiz, reuse, neg
+
+
+def _hpair_impl(p: ParsedInsn, *, opcode_r: int, opcode_ur: int,
+                byte9_base: int, byte10_base: int,
+                bf16: bool = False, has_rc: bool = False) -> int:
+    """Encoder shared by HADD2 / HMUL2 / HFMA2 and their .BF16_V2 variants.
+
+    Common layout (FP16/BF16 pair ops):
+      opcode        0x7230/0x7231/0x7232 (Ra+Rb reg form); +0x0c00 for UR Rb.
+      Rd            bits 16..23
+      Ra            bits 24..31
+      Rb / URb      bits 32..39 (+ bit 91 for UR form)
+      byte 7        swizzle/negate bits 56..63:
+                      bit 60 = Rb H1_H1, bit 61 = Rb swizzle-present,
+                      bit 62 = Ra H1_H1, bit 63 = Rb negate.
+      byte 9 bit 3  = Ra has explicit swizzle (H0_H0 or H1_H1).
+      byte 10 bit 5 = BF16_V2 variant flag (0x20).
+      Rc            bits 64..71 (HFMA2 only).
+      Rb reuse      bit 123, Rc reuse bit 124 for HFMA2; Rb reuse bit 123 for HADD2/HMUL2.
+    """
+    expected = 4 if has_rc else 3
+    if len(p.operands) != expected:
+        raise UnsupportedInstruction(f"{p.mnemonic} arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    a_tok, a_swiz, ra_reuse, ra_neg = _peel_hfp_swiz(p.operands[1])
+    b_tok, b_swiz, rb_reuse, rb_neg = _peel_hfp_swiz(p.operands[2])
+
+    # Only Ra/Rb forms covered here; Rb may be R or UR. Imm-Rb or imm-Rc are not
+    # supported (they use different packed-imm encodings).
+    ra, _ = parse_reg(a_tok)
+
+    w = 0
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 72, 8, byte9_base)
+    w = set_bits(w, 80, 8, byte10_base)
+
+    if b_tok.startswith("UR") or b_tok == "URZ":
+        urb, _ = parse_ureg(b_tok)
+        w = set_bits(w, 0, 16, opcode_ur)
+        w = set_bits(w, 32, 8, urb)
+        w = set_bits(w, 91, 1, 1)
+    elif b_tok.startswith("R") or b_tok == "RZ":
+        rb, _ = parse_reg(b_tok)
+        w = set_bits(w, 0, 16, opcode_r)
+        w = set_bits(w, 32, 8, rb)
+    else:
+        raise UnsupportedInstruction(f"{p.mnemonic} Rb {b_tok!r}")
+
+    # Byte-7 swizzle/negate nibble (Rb side only).
+    byte7 = 0
+    if b_swiz:
+        byte7 |= 0x20                                       # bit 61 (Rb swizzle-present)
+        if b_swiz == "H1_H1": byte7 |= 0x10                 # bit 60
+    if rb_neg: byte7 |= 0x80                                # bit 63
+    w = set_bits(w, 56, 8, byte7)
+
+    # Ra-side swizzle is at bits 74-75 of byte 9:
+    #   bit 75 = Ra has explicit swizzle
+    #   bit 74 = Ra is H1_H1 (vs H0_H0)
+    if a_swiz:
+        w = set_bits(w, 75, 1, 1)
+        if a_swiz == "H1_H1":
+            w = set_bits(w, 74, 1, 1)
+    if ra_neg:
+        w = set_bits(w, 72, 1, 1)                           # bit 72: -Ra
+
+    if has_rc:
+        c_tok, c_swiz, rc_reuse, rc_neg = _peel_hfp_swiz(p.operands[3])
+        rc, _ = parse_reg(c_tok)
+        w = set_bits(w, 64, 8, rc)
+        if c_swiz == "H1_H1":
+            # Rc H1_H1 shares bit 82 (byte 10 bit 2) as the swizzle flag.
+            w = set_bits(w, 82, 1, 1)
+        # Rc negate lives at byte 10 bit 1 (bit 81).
+        if rc_neg:
+            w = set_bits(w, 81, 1, 1)
+        if rc_reuse:
+            w = set_bits(w, 124, 1, 1)
+
+    if ra_reuse:
+        w = set_bits(w, 122, 1, 1)
+    if rb_reuse:
+        w = set_bits(w, 123, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("HADD2")
+def enc_hadd2(p: ParsedInsn) -> int:
+    return _hpair_impl(p, opcode_r=0x7230, opcode_ur=0x7c30,
+                       byte9_base=0x08, byte10_base=0x00)
+
+
+@register("HMUL2")
+def enc_hmul2(p: ParsedInsn) -> int:
+    return _hpair_impl(p, opcode_r=0x7232, opcode_ur=0x7c32,
+                       byte9_base=0x00, byte10_base=0x00)
+
+
+@register("HADD2.BF16_V2")
+def enc_hadd2_bf16_v2(p: ParsedInsn) -> int:
+    return _hpair_impl(p, opcode_r=0x7230, opcode_ur=0x7c30,
+                       byte9_base=0x08, byte10_base=0x20, bf16=True)
+
+
+@register("HMUL2.BF16_V2")
+def enc_hmul2_bf16_v2(p: ParsedInsn) -> int:
+    return _hpair_impl(p, opcode_r=0x7232, opcode_ur=0x7c32,
+                       byte9_base=0x00, byte10_base=0x20, bf16=True)
+
+
+@register("HFMA2.BF16_V2")
+def enc_hfma2_bf16_v2(p: ParsedInsn) -> int:
+    return _hpair_impl(p, opcode_r=0x7231, opcode_ur=0x7c31,
+                       byte9_base=0x00, byte10_base=0x24, bf16=True,
+                       has_rc=True)
 
 
 @register("HADD2.F32")
@@ -2746,28 +3168,41 @@ def _lea_base(p: ParsedInsn, *, is_uniform: bool, hi_x: bool, sx32: bool = False
     w = set_bits(w, 72, 8, byte9)
 
     is_ur_src = b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ"
+    is_reg_src = b_tok.startswith("R") or b_tok.replace(".reuse", "").strip() == "RZ"
     if is_ur_src:
         urb, rb_reuse = parse_ureg(b_tok)
         w = set_bits(w, 0, 16, base_ur)
         w = set_bits(w, 32, 8, urb)
-    else:
+    elif is_reg_src:
         rb, rb_reuse = parse_d(b_tok) if is_uniform else parse_reg(b_tok)
         w = set_bits(w, 0, 16, base_r)
         w = set_bits(w, 32, 8, rb)
+    else:
+        # Immediate at the B slot: opcode switches to the imm form.
+        imm = parse_imm(b_tok) & 0xffffffff
+        base_imm = 0x7891 if is_uniform else 0x7811
+        w = set_bits(w, 0, 16, base_imm)
+        w = set_bits(w, 32, 32, imm)
+        rb_reuse = False
+        if is_uniform:
+            # ULEA imm form still has the UR-selector bit 91 set (fixed for
+            # uniform encoding), matching the R/UR forms.
+            w = set_bits(w, 91, 1, 1)
 
     # byte 11 low nibble: 0x0e (R src) / 0x0f (UR src) for plain LEA;
     # 0x08 (R src) / 0x08 (UR src) for LEA.HI.X (UR-selector is in bit 91).
+    # Uniform-imm form also keeps the UR-selector at bit 91.
+    ur_selector = is_ur_src or (is_uniform and not is_reg_src and not is_ur_src)
     if hi_x:
         w = set_bits(w, 88, 8, 0x08)
-        w = set_bits(w, 91, 1, 1 if is_ur_src else 0)
+        w = set_bits(w, 91, 1, 1 if ur_selector else 0)
     else:
-        # byte 11: 0x07 (R src) / 0x0f (UR src) — implicit PT Ps at bits 88-90.
-        w = set_bits(w, 88, 8, 0x0f if is_ur_src else 0x07)
+        w = set_bits(w, 88, 8, 0x0f if ur_selector else 0x07)
         # For plain LEA: byte 10 = 0x80 | (Pd_idx << 1).
         w = set_bits(w, 80, 8, 0x80 | (pd_idx << 1))
 
     if hi_x:
-        rc, rc_reuse = parse_reg(c_tok)
+        rc, rc_reuse = parse_d(c_tok) if is_uniform else parse_reg(c_tok)
         w = set_bits(w, 64, 8, rc)
         ps_idx, ps_neg = _parse_pred_src(ps_tok)
         # byte 10 = 0x0f | (ps_idx_lsb << 7); bits 87-89 = ps_idx, bit 90 = ps_neg.
@@ -2815,6 +3250,40 @@ def enc_lea_hi_x_sx32(p: ParsedInsn) -> int:
 @register("ULEA")
 def enc_ulea(p: ParsedInsn) -> int:
     return _lea_base(p, is_uniform=True, hi_x=False)
+
+
+@register("ULEA.HI.X")
+def enc_ulea_hi_x(p: ParsedInsn) -> int:
+    return _lea_base(p, is_uniform=True, hi_x=True)
+
+
+@register("UGETNEXTWORKID.BROADCAST")
+def enc_ugetnextworkid_broadcast(p: ParsedInsn) -> int:
+    """UGETNEXTWORKID.BROADCAST [URd], [URa] — broadcast the next work-id.
+
+    The source [URa] is implicitly URd+1, so it doesn't appear in the encoding;
+    only URd is stored at bits 24..31.
+    """
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"UGETNEXTWORKID arity {len(p.operands)}")
+    import re as _re
+    m0 = _re.fullmatch(r"\[\s*(\S+)\s*\]", p.operands[0].strip())
+    if not m0:
+        raise UnsupportedInstruction(f"UGETNEXTWORKID operand[0] {p.operands[0]!r}")
+    urd, _ = parse_ureg(m0.group(1))
+    w = 0
+    w = set_bits(w, 0, 16, 0x73ca)
+    w = set_bits(w, 24, 8, urd)
+    w = set_bits(w, 72, 8, 0x01)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("FADD.RZ")
+def enc_fadd_rz(p: ParsedInsn) -> int:
+    """FADD.RZ — FADD with round-toward-zero rounding mode (bits 78..79 = 11)."""
+    w = enc_fadd(p)
+    return w | (0b11 << 78)
 
 
 def _parse_branch_target(tok: str) -> str:
@@ -2928,14 +3397,99 @@ def enc_bra_u(p: ParsedInsn, ctx: Context | None = None) -> int:
     return _apply_pred(w, p.pred)
 
 
+@register("CALL.ABS.NOINC")
+def enc_call_abs_noinc(p: ParsedInsn, ctx: Context | None = None) -> int:
+    """CALL.ABS.NOINC Rn — indirect call via 64-bit address in Rn."""
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"CALL.ABS.NOINC arity {len(p.operands)}")
+    rn, _ = parse_reg(p.operands[0])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7343)
+    w = set_bits(w, 24, 8, rn)
+    # Tail flags: bits 86..89 = 1111.
+    w = set_bits(w, 86, 4, 0xF)
+    return _apply_pred(w, p.pred)
+
+
+@register("CALL.REL.NOINC")
+def enc_call_rel_noinc(p: ParsedInsn, ctx: Context | None = None) -> int:
+    """CALL.REL.NOINC `(label) — PC-relative call."""
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"CALL.REL.NOINC arity {len(p.operands)}")
+    if ctx is None or ctx.labels is None:
+        raise UnsupportedInstruction("CALL.REL.NOINC without label context")
+    label = _parse_branch_target(p.operands[0])
+    target = ctx.labels.get(label)
+    if target is None:
+        raise UnsupportedInstruction(f"CALL.REL.NOINC unknown label {label!r}")
+    field = (target - ctx.pc - 16) // 4
+    w = 0
+    w = set_bits(w, 0, 16, 0x7944)
+    w = _encode_bra_offset(w, field)
+    w = set_bits(w, 86, 4, 0xF)
+    return _apply_pred(w, p.pred)
+
+
+@register("RET.REL.NODEC")
+def enc_ret_rel_nodec(p: ParsedInsn, ctx: Context | None = None) -> int:
+    """RET.REL.NODEC Rn `(label) — PC-relative return, base in Rn."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"RET.REL.NODEC arity {len(p.operands)}")
+    if ctx is None or ctx.labels is None:
+        raise UnsupportedInstruction("RET.REL.NODEC without label context")
+    rn, _ = parse_reg(p.operands[0])
+    label = _parse_branch_target(p.operands[1])
+    target = ctx.labels.get(label)
+    if target is None:
+        raise UnsupportedInstruction(f"RET.REL.NODEC unknown label {label!r}")
+    field = (target - ctx.pc - 16) // 4
+    w = 0
+    w = set_bits(w, 0, 16, 0x7950)
+    w = set_bits(w, 24, 8, rn)
+    w = _encode_bra_offset(w, field)
+    # Tail flags: bits 80, 81, 86-89 set.
+    w = set_bits(w, 80, 2, 0b11)
+    w = set_bits(w, 86, 4, 0xF)
+    return _apply_pred(w, p.pred)
+
+
+@register("LEPC")
+def enc_lepc(p: ParsedInsn, ctx: Context | None = None) -> int:
+    """LEPC Rd, `(label) — load PC-of-label into Rd (disp is raw bytes)."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"LEPC arity {len(p.operands)}")
+    if ctx is None or ctx.labels is None:
+        raise UnsupportedInstruction("LEPC without label context")
+    rd, _ = parse_reg(p.operands[0])
+    label = _parse_branch_target(p.operands[1])
+    target = ctx.labels.get(label)
+    if target is None:
+        raise UnsupportedInstruction(f"LEPC unknown label {label!r}")
+    disp = target - ctx.pc - 16
+    w = 0
+    w = set_bits(w, 0, 16, 0x794e)
+    w = set_bits(w, 16, 8, rd)
+    # LEPC stores raw byte displacement: low 8 bits at bits 24..31,
+    # high 48 bits (signed) at bits 32..79.
+    w = set_bits(w, 24, 8, disp & 0xff)
+    high = (disp >> 8) & ((1 << 48) - 1)
+    w = set_bits(w, 32, 48, high)
+    return _apply_pred(w, p.pred)
+
+
 @register("BRA")
 def enc_bra(p: ParsedInsn, ctx: Context | None = None) -> int:
-    """Unconditional BRA to a local label."""
-    if len(p.operands) != 1:
+    """BRA [Pd,] `(label) — unconditional branch, with optional pred dest."""
+    if len(p.operands) not in (1, 2):
         raise UnsupportedInstruction(f"BRA arity {len(p.operands)}")
     if ctx is None or ctx.labels is None:
         raise UnsupportedInstruction("BRA without label context")
-    label = _parse_branch_target(p.operands[0])
+    if len(p.operands) == 2:
+        pd = _parse_pred_dst(p.operands[0])
+        label = _parse_branch_target(p.operands[1])
+    else:
+        pd = 7                                              # PT sentinel
+        label = _parse_branch_target(p.operands[0])
     target = ctx.labels.get(label)
     if target is None:
         raise UnsupportedInstruction(f"BRA unknown label {label!r}")
@@ -2944,11 +3498,7 @@ def enc_bra(p: ParsedInsn, ctx: Context | None = None) -> int:
     w = 0
     w = set_bits(w, 0, 16, 0x7947)
     w = _encode_bra_offset(w, field)
-    # Tail field: bits 82-86 = 0, bit 87 = 1, bits 88-89 = 11, bits 90-95 = 0.
-    # Equivalent to bits 82..95 = 0b00_0011_1000_0000 = 0x0380 >> 0? Let me
-    # build it directly to avoid smothering the sign-extended bits.
-    w = set_bits(w, 87, 1, 1)
-    w = set_bits(w, 88, 2, 0b11)
+    w = set_bits(w, 87, 3, pd)                              # pred dst at 87..89
     return _apply_pred(w, p.pred)
 
 
@@ -3066,6 +3616,281 @@ def enc_f2i_ftz_u32_trunc_ntz(p: ParsedInsn) -> int:
     return _apply_pred(w, p.pred)
 
 
+@register("F2I.U32.TRUNC.NTZ")
+def enc_f2i_u32_trunc_ntz(p: ParsedInsn) -> int:
+    """F2I.U32.TRUNC.NTZ — non-FTZ variant (byte 10 bit 80 clear)."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"F2I arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    ra, _ = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7305)
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 32, 8, ra)
+    w = set_bits(w, 72, 8, 0xf0)
+    w = set_bits(w, 80, 8, 0x20)
+    return _apply_pred(w, p.pred)
+
+
+@register("UFLO.U32")
+def enc_uflo_u32(p: ParsedInsn) -> int:
+    """UFLO.U32 URd, URa — find leading one on a uniform register."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"UFLO arity {len(p.operands)}")
+    urd, _ = parse_ureg(p.operands[0])
+    ura, _ = parse_ureg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x72bd)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 80, 8, 0x0e)                # bits 81..83 = PT sentinel
+    w = set_bits(w, 91, 1, 1)                   # UR-form flag
+    return _apply_pred(w, p.pred)
+
+
+@register("DEPBAR")
+def enc_depbar(p: ParsedInsn) -> int:
+    """DEPBAR {b5,b4,b3,b2,b1,b0} — wait on a set of barrier indices.
+
+    The comma-separated list inside the braces is split by the generic
+    operand parser; we rejoin and parse out the integer indices here.
+    """
+    if not p.operands:
+        raise UnsupportedInstruction(f"DEPBAR arity {len(p.operands)}")
+    joined = ",".join(op.strip() for op in p.operands).strip()
+    if not (joined.startswith("{") and joined.endswith("}")):
+        raise UnsupportedInstruction(f"DEPBAR operand {joined!r}")
+    inner = joined[1:-1]
+    idxs = [int(x.strip()) for x in inner.split(",") if x.strip()]
+    mask = 0
+    for i in idxs:
+        if 0 <= i <= 5:
+            mask |= 1 << i
+    w = 0
+    w = set_bits(w, 0, 16, 0x791a)
+    w = set_bits(w, 32, 8, mask & 0x3f)
+    return _apply_pred(w, p.pred)
+
+
+@register("NANOSLEEP")
+def enc_nanosleep(p: ParsedInsn) -> int:
+    """NANOSLEEP imm — sleep for `imm` nanoseconds."""
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"NANOSLEEP arity {len(p.operands)}")
+    imm = parse_imm(p.operands[0]) & 0xffff
+    w = 0
+    w = set_bits(w, 0, 16, 0x795d)
+    w = set_bits(w, 32, 16, imm)
+    w = set_bits(w, 80, 16, 0x0380)
+    return _apply_pred(w, p.pred)
+
+
+@register("PREEXIT")
+def enc_preexit(p: ParsedInsn) -> int:
+    """PREEXIT — signal pre-exit to the warp scheduler."""
+    if len(p.operands) != 0:
+        raise UnsupportedInstruction(f"PREEXIT arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x782d)
+    return _apply_pred(w, p.pred)
+
+
+@register("YIELD")
+def enc_yield(p: ParsedInsn) -> int:
+    """YIELD — release the warp scheduler slot this cycle."""
+    if len(p.operands) != 0:
+        raise UnsupportedInstruction(f"YIELD arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x7946)
+    w = set_bits(w, 80, 16, 0x0380)
+    return _apply_pred(w, p.pred)
+
+
+@register("UCGABAR_ARV")
+def enc_ucgabar_arv(p: ParsedInsn) -> int:
+    """UCGABAR_ARV — arrive on the uniform cluster-group barrier."""
+    if len(p.operands) != 0:
+        raise UnsupportedInstruction(f"UCGABAR_ARV arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x79c7)
+    w = set_bits(w, 91, 1, 1)                   # fixed tail bit
+    return _apply_pred(w, p.pred)
+
+
+@register("UCGABAR_WAIT")
+def enc_ucgabar_wait(p: ParsedInsn) -> int:
+    """UCGABAR_WAIT — wait on the uniform cluster-group barrier."""
+    if len(p.operands) != 0:
+        raise UnsupportedInstruction(f"UCGABAR_WAIT arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x7dc7)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("BAR.ARV")
+def enc_bar_arv(p: ParsedInsn) -> int:
+    """BAR.ARV imm_barrier, imm_count — arrive-only on a CTA-level barrier.
+
+    Field layout (empirical):
+      bits 42..53 = count   (12-bit thread-count the barrier is waiting for)
+      bits 54..56 = barrier (3-bit barrier index)
+      bit  77      = fixed .ARV mode flag (byte 9 = 0x20)
+    """
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"BAR.ARV arity {len(p.operands)}")
+    bar = parse_imm(p.operands[0]) & 0xf
+    cnt = parse_imm(p.operands[1]) & 0xfff
+    w = 0
+    w = set_bits(w, 0, 16, 0x7b1d)
+    w = set_bits(w, 42, 12, cnt)
+    w = set_bits(w, 54, 4, bar)
+    w = set_bits(w, 72, 8, 0x20)
+    return _apply_pred(w, p.pred)
+
+
+@register("DADD")
+def enc_dadd(p: ParsedInsn) -> int:
+    """DADD Rd, Ra, Rb — double-precision add (Rb at Rc slot: bits 64..71)."""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction(f"DADD arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    ra, _ = parse_reg(p.operands[1])
+    rb, _ = parse_reg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7229)
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 64, 8, rb)
+    return _apply_pred(w, p.pred)
+
+
+@register("F2F.F64.F32")
+def enc_f2f_f64_f32(p: ParsedInsn) -> int:
+    """F2F.F64.F32 Rd, Ra — F32→F64 float-to-float conversion."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"F2F arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    ra, _ = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7310)
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 32, 8, ra)
+    w = set_bits(w, 72, 8, 0x18)
+    w = set_bits(w, 80, 8, 0x20)
+    return _apply_pred(w, p.pred)
+
+
+@register("UVIRTCOUNT.DEALLOC.SMPOOL")
+def enc_uvirtcount_dealloc_smpool(p: ParsedInsn) -> int:
+    """UVIRTCOUNT.DEALLOC.SMPOOL imm — deallocate SM-pool virtual counters."""
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"UVIRTCOUNT arity {len(p.operands)}")
+    imm = parse_imm(p.operands[0]) & 0xff
+    w = 0
+    w = set_bits(w, 0, 16, 0x784c)
+    w = set_bits(w, 32, 8, imm)
+    return _apply_pred(w, p.pred)
+
+
+@register("USETMAXREG.TRY_ALLOC.CTAPOOL")
+def enc_usetmaxreg_try_alloc_ctapool(p: ParsedInsn) -> int:
+    """USETMAXREG.TRY_ALLOC.CTAPOOL UPd, imm — attempt register-pool alloc."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"USETMAXREG.TRY_ALLOC arity {len(p.operands)}")
+    upd = _parse_upred_dst(p.operands[0])
+    imm = parse_imm(p.operands[1]) & 0xffffffff
+    w = 0
+    w = set_bits(w, 0, 16, 0x79c8)
+    w = set_bits(w, 32, 32, imm)
+    w = set_bits(w, 72, 8, 0x06)                # TRY_ALLOC subop
+    w = set_bits(w, 81, 3, upd)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("R2UR.OR")
+def enc_r2ur_or(p: ParsedInsn) -> int:
+    """R2UR.OR Pd, URd, Ra — or-reduce a warp into a uniform register."""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction(f"R2UR.OR arity {len(p.operands)}")
+    pd = _parse_pred_dst(p.operands[0])
+    urd, _ = parse_ureg(p.operands[1])
+    ra, ra_reuse = parse_reg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x72ca)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 80, 8, 0x14)
+    w = set_bits(w, 81, 3, pd)
+    if ra_reuse:
+        w = set_bits(w, 122, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("RPCMOV.32")
+def enc_rpcmov_32(p: ParsedInsn) -> int:
+    """RPCMOV.32 Rpc.LO|Rpc.HI, Ra — move a 32-bit half of the PC register."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"RPCMOV.32 arity {len(p.operands)}")
+    dst = p.operands[0].strip()
+    if dst not in ("Rpc.LO", "Rpc.HI"):
+        raise UnsupportedInstruction(f"RPCMOV.32 dst {dst!r}")
+    ra, _ = parse_reg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x7352)
+    w = set_bits(w, 32, 8, ra)
+    if dst == "Rpc.HI":
+        w = set_bits(w, 16, 8, 0x01)
+    return _apply_pred(w, p.pred)
+
+
+@register("CCTL.IVALL")
+def enc_cctl_ivall(p: ParsedInsn) -> int:
+    """CCTL.IVALL — invalidate all L1 cache lines (no operand)."""
+    if len(p.operands) != 0:
+        raise UnsupportedInstruction(f"CCTL.IVALL arity {len(p.operands)}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x798f)
+    w = set_bits(w, 24, 8, 0xff)
+    w = set_bits(w, 89, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("FMNMX")
+def enc_fmnmx(p: ParsedInsn) -> int:
+    """FMNMX Rd, Ra, {Rb|URb|imm}, Ps — FP min/max (Ps=PT→max, !PT→min)."""
+    if len(p.operands) != 4:
+        raise UnsupportedInstruction(f"FMNMX arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    ra, ra_reuse = parse_reg(p.operands[1])
+    b_tok = p.operands[2]
+    ps_idx, ps_neg = _parse_pred_src(p.operands[3])
+
+    w = 0
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 24, 8, ra)
+    w = set_bits(w, 87, 3, ps_idx)
+    w = set_bits(w, 90, 1, ps_neg)
+    if b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ":
+        urb, rb_reuse = parse_ureg(b_tok)
+        w = set_bits(w, 0, 16, 0x7c09)
+        w = set_bits(w, 32, 8, urb)
+        w = set_bits(w, 91, 1, 1)
+    elif b_tok.startswith("R") or b_tok.replace(".reuse", "").strip() == "RZ":
+        rb, rb_reuse = parse_reg(b_tok)
+        w = set_bits(w, 0, 16, 0x7209)
+        w = set_bits(w, 32, 8, rb)
+    else:
+        imm = _parse_float_imm(b_tok)
+        w = set_bits(w, 0, 16, 0x7409)
+        w = set_bits(w, 32, 32, imm)
+        rb_reuse = False
+    if ra_reuse: w = set_bits(w, 122, 1, 1)
+    if rb_reuse: w = set_bits(w, 123, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
 @register("P2R")
 def enc_p2r(p: ParsedInsn) -> int:
     """P2R Rd, PR, Ra, imm — pack predicate bits into register byte."""
@@ -3086,14 +3911,22 @@ def enc_p2r(p: ParsedInsn) -> int:
 
 @register("IABS")
 def enc_iabs(p: ParsedInsn) -> int:
+    """IABS Rd, {Ra | URa} — integer absolute value."""
     if len(p.operands) != 2:
         raise UnsupportedInstruction(f"IABS arity {len(p.operands)}")
     rd, _ = parse_reg(p.operands[0])
-    ra, ra_reuse = parse_reg(p.operands[1])
+    a_tok = p.operands[1]
     w = 0
-    w = set_bits(w, 0, 16, 0x7213)
     w = set_bits(w, 16, 8, rd)
-    w = set_bits(w, 32, 8, ra)
+    if a_tok.startswith("UR") or a_tok.replace(".reuse", "").strip() == "URZ":
+        ura, ra_reuse = parse_ureg(a_tok)
+        w = set_bits(w, 0, 16, 0x7c13)
+        w = set_bits(w, 32, 8, ura)
+        w = set_bits(w, 91, 1, 1)
+    else:
+        ra, ra_reuse = parse_reg(a_tok)
+        w = set_bits(w, 0, 16, 0x7213)
+        w = set_bits(w, 32, 8, ra)
     if ra_reuse:
         w = set_bits(w, 123, 1, 1)
     return _apply_pred(w, p.pred)
@@ -3377,11 +4210,24 @@ def enc_r2p(p: ParsedInsn) -> int:
     return _apply_pred(w, p.pred)
 
 
-def _shfl_impl(p: ParsedInsn, *, subop: int) -> int:
-    """SHFL.<subop> Pd, Rd, Ra, Rb|imm, Rc|imm — warp shuffle.
+SHFL_SUBOP = {"IDX": 0, "UP": 1, "DOWN": 2, "BFLY": 3}
 
-    Observed: `SHFL.IDX PT, R5, R2, RZ, 0x1f`. Only the "Rb=RZ, imm=mask"
-    form is supported here.
+
+def _shfl_impl(p: ParsedInsn, *, subop: int) -> int:
+    """SHFL.<subop> Pd, Rd, Ra, Rb|imm5, Rc|imm13 — warp shuffle.
+
+    Layout (structural bits, ignoring predicate guard):
+      opcode       bits 0..7    = 0x89
+      byte 1       bits 8..15   = 0x75 base; bit 10 set if Rc is imm,
+                                  bit 11 set if Rb is imm, bit 9 set if both.
+      Rd           bits 16..23
+      Ra           bits 24..31
+      Rb           bits 32..39  = 0xff when Rb is imm
+      imm_c        bits 40..52  (13-bit shuffle mask)
+      imm_b        bits 53..57  (5-bit shift amount)
+      subop        bits 58..59  (IDX=0, UP=1, DOWN=2, BFLY=3)
+      Rc           bits 64..71
+      bits 80..87  = 0x0e (fixed tail flag across all SHFL forms)
     """
     if len(p.operands) != 5:
         raise UnsupportedInstruction(f"SHFL arity {len(p.operands)}")
@@ -3391,36 +4237,58 @@ def _shfl_impl(p: ParsedInsn, *, subop: int) -> int:
     ra, _ = parse_reg(p.operands[2])
     b_tok = p.operands[3]
     c_tok = p.operands[4]
+
+    b_is_imm = not (b_tok.startswith("R") or b_tok == "RZ")
+    c_is_imm = not (c_tok.startswith("R") or c_tok == "RZ")
+
+    byte1 = 0x71
+    if c_is_imm: byte1 |= 0x04                               # bit 10
+    if b_is_imm: byte1 |= 0x08                               # bit 11
+    if b_is_imm and c_is_imm: byte1 |= 0x02                  # bit 9
+
     w = 0
-    w = set_bits(w, 0, 16, 0x7589)
+    w = set_bits(w, 0, 8, 0x89)
+    w = set_bits(w, 8, 8, byte1)
     w = set_bits(w, 16, 8, rd)
     w = set_bits(w, 24, 8, ra)
-    # byte 4 = Rb or 0xff if RZ; byte 5 onwards for imm.
-    if b_tok.startswith("R") or b_tok == "RZ":
+
+    if b_is_imm:
+        # When Rb slot is immediate, byte 4 stays zero; the imm lives at bits 53..57.
+        w = set_bits(w, 53, 5, parse_imm(b_tok) & 0x1f)
+    else:
         rb, _ = parse_reg(b_tok)
         w = set_bits(w, 32, 8, rb)
+
+    if c_is_imm:
+        # When Rc slot is immediate, byte 8 stays zero; the imm lives at bits 40..52.
+        w = set_bits(w, 40, 13, parse_imm(c_tok) & 0x1fff)
     else:
-        raise UnsupportedInstruction(f"SHFL Rb {b_tok!r}")
-    # Rc/imm slot — if Rc=RZ, use imm at bits 40+ (6-bit mask).
-    if c_tok.startswith("R") or c_tok == "RZ":
         rc, _ = parse_reg(c_tok)
         w = set_bits(w, 64, 8, rc)
-    else:
-        imm = parse_imm(c_tok) & 0x1f
-        w = set_bits(w, 40, 8, imm)
-    # byte 10: subop (IDX=0x0e, UP=0x0c etc.).
-    w = set_bits(w, 80, 8, subop)
+
+    w = set_bits(w, 58, 2, subop)
+    w = set_bits(w, 80, 8, 0x0e)
     return _apply_pred(w, p.pred)
 
 
 @register("SHFL.IDX")
 def enc_shfl_idx(p: ParsedInsn) -> int:
-    return _shfl_impl(p, subop=0x0e)
+    return _shfl_impl(p, subop=SHFL_SUBOP["IDX"])
 
 
 @register("SHFL.UP")
 def enc_shfl_up(p: ParsedInsn) -> int:
-    return _shfl_impl(p, subop=0x0a)
+    return _shfl_impl(p, subop=SHFL_SUBOP["UP"])
+
+
+@register("SHFL.DOWN")
+def enc_shfl_down(p: ParsedInsn) -> int:
+    return _shfl_impl(p, subop=SHFL_SUBOP["DOWN"])
+
+
+@register("SHFL.BFLY")
+def enc_shfl_bfly(p: ParsedInsn) -> int:
+    return _shfl_impl(p, subop=SHFL_SUBOP["BFLY"])
 
 
 @register("VOTEU.ANY")
@@ -3605,17 +4473,25 @@ def enc_vimnmx(p: ParsedInsn) -> int:
 
 @register("VIADD")
 def enc_viadd(p: ParsedInsn) -> int:
-    """VIADD Rd, Ra, imm — observed as a simple 3-operand imm add."""
+    """VIADD Rd, Ra, {imm32 | URb}"""
     if len(p.operands) != 3:
         raise UnsupportedInstruction(f"VIADD arity {len(p.operands)}")
     rd, _ = parse_reg(p.operands[0])
     ra, ra_reuse = parse_reg(p.operands[1])
-    imm = parse_imm(p.operands[2]) & 0xffffffff
+    b_tok = p.operands[2]
     w = 0
-    w = set_bits(w, 0, 16, 0x7836)
     w = set_bits(w, 16, 8, rd)
     w = set_bits(w, 24, 8, ra)
-    w = set_bits(w, 32, 32, imm)
+    if b_tok.startswith("UR") or b_tok.replace(".reuse", "").strip() == "URZ":
+        urb, rb_reuse = parse_ureg(b_tok)
+        w = set_bits(w, 0, 16, 0x7c36)
+        w = set_bits(w, 32, 8, urb)
+        w = set_bits(w, 91, 1, 1)
+        if rb_reuse: w = set_bits(w, 123, 1, 1)
+    else:
+        imm = parse_imm(b_tok) & 0xffffffff
+        w = set_bits(w, 0, 16, 0x7836)
+        w = set_bits(w, 32, 32, imm)
     if ra_reuse:
         w = set_bits(w, 122, 1, 1)
     return _apply_pred(w, p.pred)
@@ -3812,8 +4688,9 @@ def _imad_like(p: ParsedInsn, *, base_r: int, base_ur: int, base_imm: int,
     b_tok = p.operands[2]
     c_tok = p.operands[3]
 
-    # -Rc (bit 75 in byte 9 for reg-Rc; bit 63 for UR-at-C).
-    rc_neg = c_tok.startswith("-")
+    # `-Rc` and `~Rc` both set the Rc-negate flag (bit 75 for reg-Rc, bit 63
+    # in the UR-at-C swap form).
+    rc_neg = c_tok.startswith("-") or c_tok.startswith("~")
     if rc_neg:
         c_tok = c_tok[1:].strip()
 
@@ -3933,8 +4810,74 @@ def enc_imad_iadd(p: ParsedInsn) -> int:
 
 @register("UIMAD.WIDE.U32")
 def enc_uimad_wide_u32(p: ParsedInsn) -> int:
+    # Optional 5th-op form: UIMAD.WIDE.U32 URd, UPcarry_out, URa, URb, URc.
+    if len(p.operands) == 5 and re.fullmatch(r"UP[0-9T]", p.operands[1]):
+        pc = _parse_upred_dst(p.operands[1])
+        p4 = ParsedInsn(pred=p.pred, mnemonic=p.mnemonic,
+                         operands=[p.operands[0]] + p.operands[2:])
+        w = _imad_like(p4, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
+                       byte9=0x00, is_uniform=True)
+        w = set_bits(w, 80, 8, 0x80 | (pc << 1))
+        return w
     return _imad_like(p, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
                       byte9=0x00, is_uniform=True)
+
+
+@register("UIMAD.WIDE")
+def enc_uimad_wide(p: ParsedInsn) -> int:
+    """UIMAD.WIDE — signed wide multiply-add on uniform registers."""
+    if len(p.operands) == 5 and re.fullmatch(r"UP[0-9T]", p.operands[1]):
+        pc = _parse_upred_dst(p.operands[1])
+        p4 = ParsedInsn(pred=p.pred, mnemonic=p.mnemonic,
+                         operands=[p.operands[0]] + p.operands[2:])
+        w = _imad_like(p4, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
+                       byte9=0x02, is_uniform=True)
+        w = set_bits(w, 80, 8, 0x80 | (pc << 1))
+        return w
+    return _imad_like(p, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
+                      byte9=0x02, is_uniform=True)
+
+
+def _imad_wide_x(p: ParsedInsn, *, base_r: int, base_ur: int, base_imm: int,
+                 is_uniform: bool, byte9: int) -> int:
+    """IMAD.WIDE.X variant: base form plus .X flag (bit 74) and Pcarry-in."""
+    if len(p.operands) != 5:
+        raise UnsupportedInstruction(f"{p.mnemonic} arity {len(p.operands)}")
+    pc_in_idx, _ = _parse_pred_src(p.operands[4])
+    p4 = ParsedInsn(pred=p.pred, mnemonic=p.mnemonic, operands=p.operands[:4])
+    w = _imad_like(p4, base_r=base_r, base_ur=base_ur, base_imm=base_imm,
+                   byte9=byte9, is_uniform=is_uniform)
+    ur_form = (w >> 91) & 1
+    # Rewrite bits 80..95: 0x000e (PT dst sentinel) + Pc_in index at 87..89.
+    w = set_bits(w, 80, 16, 0x000e)
+    w = set_bits(w, 87, 3, pc_in_idx)
+    if ur_form:
+        w = set_bits(w, 91, 1, 1)
+    return w
+
+
+@register("IMAD.WIDE.U32.X")
+def enc_imad_wide_u32_x(p: ParsedInsn) -> int:
+    return _imad_wide_x(p, base_r=0x7225, base_ur=0x7c25, base_imm=0x7825,
+                        is_uniform=False, byte9=0x04)
+
+
+@register("IMAD.WIDE.X")
+def enc_imad_wide_x(p: ParsedInsn) -> int:
+    return _imad_wide_x(p, base_r=0x7225, base_ur=0x7c25, base_imm=0x7825,
+                        is_uniform=False, byte9=0x06)
+
+
+@register("UIMAD.WIDE.U32.X")
+def enc_uimad_wide_u32_x(p: ParsedInsn) -> int:
+    return _imad_wide_x(p, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
+                        is_uniform=True, byte9=0x04)
+
+
+@register("UIMAD.WIDE.X")
+def enc_uimad_wide_x(p: ParsedInsn) -> int:
+    return _imad_wide_x(p, base_r=0x72a5, base_ur=0x72a5, base_imm=0x78a5,
+                        is_uniform=True, byte9=0x06)
 
 
 @register("IMAD.X")
@@ -3962,6 +4905,15 @@ def enc_imad_x(p: ParsedInsn) -> int:
 
 @register("IMAD.HI.U32")
 def enc_imad_hi_u32(p: ParsedInsn) -> int:
+    # Optional 5-op form: IMAD.HI.U32 Rd, Pcarry_out, Ra, Rb, Rc.
+    if len(p.operands) == 5 and re.fullmatch(r"P[0-9T]", p.operands[1]):
+        pc = _parse_pred_dst(p.operands[1])
+        p4 = ParsedInsn(pred=p.pred, mnemonic=p.mnemonic,
+                         operands=[p.operands[0]] + p.operands[2:])
+        w = _imad_like(p4, base_r=0x7227, base_ur=0x7c27, base_imm=0x7827,
+                       byte9=0x00, is_uniform=False)
+        w = set_bits(w, 80, 8, 0x80 | (pc << 1))
+        return w
     return _imad_like(p, base_r=0x7227, base_ur=0x7c27, base_imm=0x7827,
                       byte9=0x00, is_uniform=False)
 
@@ -4028,13 +4980,15 @@ def enc_iadd3(p: ParsedInsn) -> int:
     pc1 = _parse_pred_dst(p.operands[1])
     pc2 = _parse_pred_dst(p.operands[2])
     a_tok = p.operands[3]
-    ra_neg = a_tok.startswith("-")
+    # IADD3 accepts both `-Ra` (arith negate) and `~Ra` (bitwise-not);
+    # both set the same negate-flag bit at 72.
+    ra_neg = a_tok.startswith("-") or a_tok.startswith("~")
     if ra_neg:
         a_tok = a_tok[1:].strip()
     ra, ra_reuse = parse_reg(a_tok)
     b_tok = p.operands[4]
     c_tok = p.operands[5]
-    rc_neg = c_tok.startswith("-")
+    rc_neg = c_tok.startswith("-") or c_tok.startswith("~")
     if rc_neg:
         c_tok = c_tok[1:].strip()
     rc, rc_reuse = parse_reg(c_tok)
@@ -4051,10 +5005,10 @@ def enc_iadd3(p: ParsedInsn) -> int:
     w = set_bits(w, 87, 1, 1)                   # fixed
     w = set_bits(w, 88, 3, 7)                   # Ps = PT (always in this data)
 
-    # If B starts with `-`, it might be reg negation or a negative imm.
-    # Peek at the token after stripping `-` to decide.
+    # If B starts with `-` or `~`, it's a reg negate/bitwise-not flag.
+    # Negative-literal immediates are left intact for parse_imm.
     raw_b = b_tok
-    if b_tok.startswith("-"):
+    if b_tok.startswith("-") or b_tok.startswith("~"):
         stripped = b_tok[1:].strip()
         if stripped.startswith("UR") or stripped.startswith("R") or stripped in ("URZ", "RZ"):
             b_neg_flag = True
