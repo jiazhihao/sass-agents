@@ -459,32 +459,215 @@ def _parse_desc_ur(tok: str) -> int:
     return ur
 
 
-def _utmaldg_impl(p: ParsedInsn, *, cta2: bool) -> int:
-    """UTMALDG.3D[.2CTA] [URa], [URb], desc[URc]"""
-    if len(p.operands) != 3:
+def _utmaldg_impl(p: ParsedInsn, *, byte9: int, byte10: int,
+                   multicast: bool) -> int:
+    """UTMALDG.<dim>[.MULTICAST][.2CTA] — 3 or 4 operand TMA global load.
+
+    Non-multicast: [URa], [URb], desc[URc]      (3 operands)
+    Multicast:     [URa], [URb], URm, desc[URc] (4 operands)
+    """
+    expected = 4 if multicast else 3
+    if len(p.operands) != expected:
         raise UnsupportedInstruction(f"UTMALDG arity {len(p.operands)}")
     ura = _parse_ur_addr(p.operands[0])
     urb = _parse_ur_addr(p.operands[1])
-    urc = _parse_desc_ur(p.operands[2])
+    if multicast:
+        urm, _ = parse_ureg(p.operands[2])
+        urc = _parse_desc_ur(p.operands[3])
+    else:
+        urm = 0x00
+        urc = _parse_desc_ur(p.operands[2])
     w = 0
     w = set_bits(w, 0, 16, 0x75b4)
     w = set_bits(w, 24, 8, urb)
     w = set_bits(w, 32, 8, ura)
     w = set_bits(w, 40, 8, urc)
-    w = set_bits(w, 72, 8, 0x10)
-    w = set_bits(w, 80, 8, 0x21 if cta2 else 0x01)
+    if multicast:
+        w = set_bits(w, 64, 8, urm)
+        # UTMALDG.3D.MULTICAST uses the 0x73xx opcode (bit 9 = 0 vs 0x75xx's bit 10).
+        w = set_bits(w, 0, 16, 0x73b4)
+    w = set_bits(w, 72, 8, byte9)
+    w = set_bits(w, 80, 8, byte10)
     w = set_bits(w, 91, 1, 1)
     return _apply_pred(w, p.pred)
 
 
-@register("UTMALDG.3D")
-def enc_utmaldg_3d(p: ParsedInsn) -> int:
-    return _utmaldg_impl(p, cta2=False)
+# Mapping of UTMALDG modifier combos to (byte9, byte10) empirical values.
+_UTMALDG_VARIANTS = {
+    # dim, multicast, 2cta
+    ("2D", False, False): (0x90, 0x00),
+    ("2D", True,  False): (0x98, 0x00),
+    ("2D", False, True ): (0x90, 0x20),
+    ("2D", True,  True ): (0x98, 0x20),
+    ("3D", False, False): (0x10, 0x01),
+    ("3D", True,  False): (0x18, 0x01),
+    ("3D", False, True ): (0x10, 0x21),
+    ("3D", True,  True ): (0x18, 0x21),
+    ("4D", False, False): (0x90, 0x01),
+    ("4D", True,  False): (0x98, 0x01),
+    ("4D", False, True ): (0x90, 0x21),
+    ("4D", True,  True ): (0x98, 0x21),
+    ("5D", False, False): (0x10, 0x02),
+}
 
 
-@register("UTMALDG.3D.2CTA")
-def enc_utmaldg_3d_2cta(p: ParsedInsn) -> int:
-    return _utmaldg_impl(p, cta2=True)
+def _mk_utmaldg(dim: str, mc: bool, cta2: bool):
+    byte9, byte10 = _UTMALDG_VARIANTS[(dim, mc, cta2)]
+    def enc(p: ParsedInsn, ctx=None) -> int:
+        return _utmaldg_impl(p, byte9=byte9, byte10=byte10, multicast=mc)
+    return enc
+
+
+for _dim in ("2D", "3D", "4D", "5D"):
+    for _mc in (False, True):
+        for _cta2 in (False, True):
+            if (_dim, _mc, _cta2) not in _UTMALDG_VARIANTS:
+                continue
+            _name = f"UTMALDG.{_dim}"
+            if _mc: _name += ".MULTICAST"
+            if _cta2: _name += ".2CTA"
+            _TABLE[_name] = _mk_utmaldg(_dim, _mc, _cta2)
+
+
+@register("UTMALDG.5D.IM2COL")
+def enc_utmaldg_5d_im2col(p: ParsedInsn) -> int:
+    """UTMALDG.5D.IM2COL [URa], [URb], URc — image-to-column variant."""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction("UTMALDG.5D.IM2COL arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    urc, _ = parse_ureg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b4)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 64, 8, urc)                  # URc at byte 8
+    w = set_bits(w, 80, 8, 0x06)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCATOMSWS.AND")
+def enc_utcatomsws_and(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTCATOMSWS.AND arity")
+    urd, _ = parse_ureg(p.operands[0])
+    ura, _ = parse_ureg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x79e3)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+def _utcatomsws_fas_impl(p: ParsedInsn, *, cta2: bool) -> int:
+    """UTCATOMSWS[.2CTA].FIND_AND_SET.ALIGN UPd, URd, URa"""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction("UTCATOMSWS.FAS arity")
+    upd = _parse_upred_dst(p.operands[0])
+    urd, _ = parse_ureg(p.operands[1])
+    ura, _ = parse_ureg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x75e3)
+    w = set_bits(w, 16, 8, urd)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 72, 8, 0x08)
+    w = set_bits(w, 81, 3, upd)
+    if cta2:
+        w = set_bits(w, 80, 8, 0x20 | (upd << 1))
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCATOMSWS.FIND_AND_SET.ALIGN")
+def enc_utcatomsws_fas(p: ParsedInsn) -> int:
+    return _utcatomsws_fas_impl(p, cta2=False)
+
+
+@register("UTCATOMSWS.2CTA.FIND_AND_SET.ALIGN")
+def enc_utcatomsws_2cta_fas(p: ParsedInsn) -> int:
+    return _utcatomsws_fas_impl(p, cta2=True)
+
+
+@register("UTMASTG.5D.IM2COL")
+def enc_utmastg_5d_im2col(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTMASTG.5D.IM2COL arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b5)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 80, 8, 0x06)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCBAR.MULTICAST")
+def enc_utcbar_multicast(p: ParsedInsn) -> int:
+    """UTCBAR.MULTICAST [URa], URb, URc"""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction("UTCBAR.MULTICAST arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb, _ = parse_ureg(p.operands[1])
+    urc, _ = parse_ureg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73e9)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 64, 8, urc)
+    w = set_bits(w, 72, 8, 0x08)                 # MULTICAST only
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTMAREDG.3D.ADD")
+def enc_utmaredg_3d_add(p: ParsedInsn) -> int:
+    """UTMAREDG.3D.ADD [URa], [URb] — reduction variant of UTMASTG."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTMAREDG.3D.ADD arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b6)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 80, 8, 0x01)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTMASTG.4D")
+def enc_utmastg_4d(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTMASTG.4D arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b5)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 72, 8, 0x80)                # 4D flag
+    w = set_bits(w, 80, 8, 0x01)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTMASTG.5D")
+def enc_utmastg_5d(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTMASTG.5D arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b5)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 80, 8, 0x02)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
 
 
 @register("UTMASTG.3D")
@@ -578,6 +761,452 @@ def enc_ldsm_16_mt88_4(p: ParsedInsn) -> int:
     w = set_bits(w, 72, 8, 0x42)
     if ur != 0xff:
         w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+TMEM_RE = re.compile(r"^tmem\[\s*(UR\d+|URZ)\s*(?:([+-])\s*(0x[0-9a-fA-F]+|\d+))?\s*\]$")
+GDESC_RE = re.compile(r"^gdesc\[\s*(UR\d+|URZ)\s*\]$")
+
+
+def _parse_tmem(tok: str) -> tuple[int, int]:
+    m = TMEM_RE.fullmatch(tok.strip())
+    if not m:
+        raise UnsupportedInstruction(f"bad tmem {tok!r}")
+    ur, _ = parse_ureg(m.group(1))
+    off = 0
+    if m.group(2) is not None:
+        off = int(m.group(3), 0)
+        if m.group(2) == "-":
+            off = -off
+    return ur, off
+
+
+def _parse_gdesc(tok: str) -> int:
+    m = GDESC_RE.fullmatch(tok.strip())
+    if not m:
+        raise UnsupportedInstruction(f"bad gdesc {tok!r}")
+    ur, _ = parse_ureg(m.group(1))
+    return ur
+
+
+# --- LDTM / STTM ---------------------------------------------------------
+# byte 10 (bits 80..87) encodes both a fixed LDTM/STTM marker and the "count"
+# suffix (.x2/.x8/.x16/.x32/.x64). Observed byte 10 values:
+LDTM_BYTE10 = {
+    "x2":   0x0c,
+    "x4":   0x14,
+    "x8":   0x1c,
+    "x16":  0x24,
+    "x32":  0x2c,
+    "x64":  0x34,
+    "x128": 0x3c,
+}
+
+
+LDTM_16DP256_BYTE10 = {
+    "x2":  0x0a,
+    "x4":  0x12,
+    "x8":  0x1a,
+    "x16": 0x22,
+}
+
+
+def _ldtm_impl(p: ParsedInsn, *, width: str) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"LDTM arity {len(p.operands)}")
+    rd, _ = parse_reg(p.operands[0])
+    ur, off = _parse_tmem(p.operands[1])
+    if width not in LDTM_BYTE10:
+        raise UnsupportedInstruction(f"LDTM width {width!r}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x79ee)
+    w = set_bits(w, 16, 8, rd)
+    w = set_bits(w, 32, 8, ur)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 80, 8, LDTM_BYTE10[width])
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+def _sttm_impl(p: ParsedInsn, *, width: str) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"STTM arity {len(p.operands)}")
+    ur, off = _parse_tmem(p.operands[0])
+    rb, _ = parse_reg(p.operands[1])
+    if width not in LDTM_BYTE10:
+        raise UnsupportedInstruction(f"STTM width {width!r}")
+    w = 0
+    w = set_bits(w, 0, 16, 0x79ed)
+    w = set_bits(w, 32, 8, rb)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 64, 8, ur)                  # URa at bits 64..71 (not 24)
+    w = set_bits(w, 80, 8, LDTM_BYTE10[width])
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+for _wid in LDTM_BYTE10:
+    _TABLE[f"LDTM.{_wid}"] = (lambda p, ctx=None, _w=_wid: _ldtm_impl(p, width=_w))
+    _TABLE[f"STTM.{_wid}"] = (lambda p, ctx=None, _w=_wid: _sttm_impl(p, width=_w))
+
+
+def _ldtm_16dp256_impl(p: ParsedInsn, *, width: str) -> int:
+    w = _ldtm_impl(p, width="x2")  # temp to reuse machinery
+    w = set_bits(w, 80, 8, LDTM_16DP256_BYTE10[width])
+    return w
+
+
+def _sttm_16dp128_impl(p: ParsedInsn, *, width: str, byte10: int) -> int:
+    w = _sttm_impl(p, width="x2")
+    w = set_bits(w, 80, 8, byte10)
+    return w
+
+
+for _wid in LDTM_16DP256_BYTE10:
+    _TABLE[f"LDTM.16dp256bit.{_wid}"] = (
+        lambda p, ctx=None, _w=_wid: _ldtm_16dp256_impl(p, width=_w))
+
+
+# STTM.16dp128bit.x16 observed byte 10 = 0x20.
+_TABLE["STTM.16dp128bit.x16"] = (
+    lambda p, ctx=None: _sttm_16dp128_impl(p, width="x16", byte10=0x20))
+
+
+# --- LDSM / STSM 16-bit matrix moves ------------------------------------
+def _lds_matrix_impl(p: ParsedInsn, *, opcode: int, dst_is_reg: bool,
+                     mt: bool, count_log2: int) -> int:
+    """LDSM.16.[M|MT]88.{x2,x4,x8} Rd, [addr]  or
+    STSM.16.[M|MT]88.{x2,x4,x8} [addr], Rb
+    """
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"{p.mnemonic} arity {len(p.operands)}")
+    if dst_is_reg:
+        rd, _ = parse_reg(p.operands[0])
+        addr = p.operands[1]
+        ra, ur, off = _parse_syncs_addr(addr)
+        w = 0
+        w = set_bits(w, 0, 16, opcode)
+        w = set_bits(w, 16, 8, rd)
+        w = set_bits(w, 24, 8, ra)
+        w = set_bits(w, 32, 8, 0x00 if ur == 0xff else ur)
+        w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+        if ur != 0xff:
+            w = set_bits(w, 91, 1, 1)
+    else:
+        addr = p.operands[0]
+        ra, ur, off = _parse_syncs_addr(addr)
+        rb, _ = parse_reg(p.operands[1])
+        w = 0
+        w = set_bits(w, 0, 16, opcode)
+        w = set_bits(w, 24, 8, ra)
+        w = set_bits(w, 32, 8, rb)
+        w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+        if ur != 0xff:
+            w = set_bits(w, 64, 8, ur)
+            w = set_bits(w, 91, 1, 1)
+
+    byte9 = count_log2 | (0x40 if mt else 0)
+    w = set_bits(w, 72, 8, byte9)
+    return _apply_pred(w, p.pred)
+
+
+for _ct, _cl in [("2", 1), ("4", 2), ("8", 3)]:
+    # LDSM.16.M88.*
+    _TABLE[f"LDSM.16.M88.{_ct}"] = (lambda p, ctx=None, _c=_cl:
+        _lds_matrix_impl(p, opcode=0x783b, dst_is_reg=True, mt=False, count_log2=_c))
+    # LDSM.16.MT88.*
+    _TABLE[f"LDSM.16.MT88.{_ct}"] = (lambda p, ctx=None, _c=_cl:
+        _lds_matrix_impl(p, opcode=0x783b, dst_is_reg=True, mt=True, count_log2=_c))
+    # STSM.16.M88.*
+    _TABLE[f"STSM.16.M88.{_ct}"] = (lambda p, ctx=None, _c=_cl:
+        _lds_matrix_impl(p, opcode=0x7844, dst_is_reg=False, mt=False, count_log2=_c))
+    # STSM.16.MT88.* (covers MT88.4 already, re-registered here for completeness)
+    _TABLE[f"STSM.16.MT88.{_ct}"] = (lambda p, ctx=None, _c=_cl:
+        _lds_matrix_impl(p, opcode=0x7844, dst_is_reg=False, mt=True, count_log2=_c))
+
+
+# --- UTCBAR family -------------------------------------------------------
+@register("UTCBAR")
+def enc_utcbar(p: ParsedInsn) -> int:
+    """UTCBAR [URa], URb — tensor-core barrier."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"UTCBAR arity {len(p.operands)}")
+    ura = _parse_ur_addr(p.operands[0])
+    urb, _ = parse_ureg(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73e9)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 64, 8, 0xff)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCBAR.2CTA.MULTICAST")
+def enc_utcbar_2cta_multicast(p: ParsedInsn) -> int:
+    """UTCBAR.2CTA.MULTICAST [URa], URb, URc"""
+    if len(p.operands) != 3:
+        raise UnsupportedInstruction(f"UTCBAR.2CTA.MULTICAST arity {len(p.operands)}")
+    ura = _parse_ur_addr(p.operands[0])
+    urb, _ = parse_ureg(p.operands[1])
+    urc, _ = parse_ureg(p.operands[2])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73e9)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 64, 8, urc)
+    w = set_bits(w, 72, 8, 0x08)                # 2CTA flag
+    w = set_bits(w, 80, 8, 0x20)                # MULTICAST flag
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+# --- ACQBULK -------------------------------------------------------------
+@register("ACQBULK")
+def enc_acqbulk(p: ParsedInsn) -> int:
+    if p.operands:
+        raise UnsupportedInstruction("ACQBULK has no operands")
+    w = 0
+    w = set_bits(w, 0, 16, 0x782e)
+    return _apply_pred(w, p.pred)
+
+
+# --- UTMACCTL.IV --------------------------------------------------------
+@register("UTMACCTL.IV")
+def enc_utmacctl_iv(p: ParsedInsn) -> int:
+    if len(p.operands) != 1:
+        raise UnsupportedInstruction(f"UTMACCTL.IV arity {len(p.operands)}")
+    ur = _parse_ur_addr(p.operands[0])
+    w = 0
+    w = set_bits(w, 0, 16, 0x79b9)
+    w = set_bits(w, 24, 8, ur)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+# --- UTMAPF.L2.3D -------------------------------------------------------
+@register("UTMAPF.L2.3D")
+def enc_utmapf_l2_3d(p: ParsedInsn) -> int:
+    """UTMAPF.L2.3D [URa], [URb] — prefetch L2."""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction(f"UTMAPF.L2.3D arity {len(p.operands)}")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x75b8)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 80, 8, 0x01)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+# UTMALDG.2D/3D/4D/5D and their .MULTICAST/.2CTA variants are registered
+# above via the _mk_utmaldg loop. UTMASTG.2D:
+@register("UTMASTG.2D")
+def enc_utmastg_2d(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTMASTG.2D arity")
+    ura = _parse_ur_addr(p.operands[0])
+    urb = _parse_ur_addr(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x73b5)
+    w = set_bits(w, 24, 8, urb)
+    w = set_bits(w, 32, 8, ura)
+    w = set_bits(w, 72, 8, 0x80)                # 2D flag
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+# --- UTCCP tensor copy --------------------------------------------------
+@register("UTCCP.T.S.4x32dp128bit")
+def enc_utccp_t_s_4x32dp128bit(p: ParsedInsn) -> int:
+    """UTCCP.T.S.4x32dp128bit tmem[URa (+off)?], gdesc[URb]"""
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTCCP arity")
+    ura, off = _parse_tmem(p.operands[0])
+    urb = _parse_gdesc(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x79e7)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 80, 8, 0x10)
+    w = set_bits(w, 88, 8, 0x09)
+    return _apply_pred(w, p.pred)
+
+
+def _parse_idesc(tok: str) -> int:
+    m = re.fullmatch(r"idesc\[\s*(UR\d+|URZ)\s*\]", tok.strip())
+    if not m:
+        raise UnsupportedInstruction(f"bad idesc {tok!r}")
+    ur, _ = parse_ureg(m.group(1))
+    return ur
+
+
+def _parse_gdesc_or_tmem(tok: str) -> tuple[int, str]:
+    """Accept either gdesc[URx] or tmem[URx] operand 0 of UTC*MMA."""
+    tok = tok.strip()
+    if tok.startswith("gdesc["):
+        return _parse_gdesc(tok), "gdesc"
+    if tok.startswith("tmem["):
+        ur, _ = _parse_tmem(tok)
+        return ur, "tmem"
+    raise UnsupportedInstruction(f"UTC*MMA op0 {tok!r}")
+
+
+def _utc_mma_impl(p: ParsedInsn, *, byte9: int, cta2: bool,
+                  omma: bool = False) -> int:
+    """UTCHMMA / UTCQMMA / UTCHMMA.2CTA / UTCQMMA.2CTA / UTCOMMA[.2CTA].4X
+
+    Supports two operand-0 forms:
+      gdesc-first : gdescA, gdescB, tmemA(dst), tmemB(acc), idesc, [tmemC,] Ps
+      tmem-first  : tmemA,  gdesc,  tmemB,      tmemC,      idesc, Ps
+    """
+    n = len(p.operands)
+    if n not in (6, 7):
+        raise UnsupportedInstruction(f"UTC*MMA arity {n}")
+    op0, op0_type = _parse_gdesc_or_tmem(p.operands[0])
+
+    extra_imm = 0
+    if op0_type == "gdesc":
+        g_a = op0
+        g_b = _parse_gdesc(p.operands[1])
+        t_a, _ = _parse_tmem(p.operands[2])
+        t_b, _ = _parse_tmem(p.operands[3])
+        _parse_idesc(p.operands[4])
+        if n == 7:
+            # Distinguish the two 7-operand forms:
+            #   (a) ..., tmemC, Ps           — extra accumulator tmem
+            #   (b) ..., Ps,     0x<imm>     — extra immediate control flag
+            op5 = p.operands[5].strip()
+            if op5.startswith("tmem["):
+                t_c, _ = _parse_tmem(op5)
+                ps_tok = p.operands[6]
+            else:
+                t_c = 0xff
+                ps_tok = op5
+                extra_imm = parse_imm(p.operands[6]) & 0xff
+        else:
+            t_c = 0xff
+            ps_tok = p.operands[5]
+    else:
+        # tmem-first: op0=tmemA, op1=gdesc, op2=tmemB, op3=tmemC, op4=idesc, op5=Ps
+        t_a = op0
+        g_b = _parse_gdesc(p.operands[1])
+        t_b, _ = _parse_tmem(p.operands[2])
+        t_c, _ = _parse_tmem(p.operands[3])
+        _parse_idesc(p.operands[4])
+        g_a = 0x00                       # unused in tmem-first form
+        ps_tok = p.operands[5] if n >= 6 else None
+    ps_idx, ps_neg = _parse_pred_src(ps_tok)
+
+    w = 0
+    # Opcode selection:
+    #   tmem-first non-QMMA:              0x79ea  (bit 10 = 1)
+    #   tmem-first QMMA:                  0x79ea
+    #   gdesc-first HMMA/OMMA:            0x75ea
+    #   gdesc-first QMMA 7-op:            0x7dea
+    #   gdesc-first HMMA/QMMA 6-op:       0x75ea
+    # The "7-op with extra tmemC" form uses 0x7dea for QMMA; 0x75ea otherwise.
+    # The "7-op with Ps + imm" form uses 0x75ea regardless.
+    seven_op_with_tmemC = (n == 7) and (extra_imm == 0) and (op0_type == "gdesc")
+    if op0_type == "tmem":
+        opcode = 0x79ea
+    elif (byte9 == 0x03) and seven_op_with_tmemC:
+        opcode = 0x7dea
+    else:
+        opcode = 0x75ea
+    w = set_bits(w, 0, 16, opcode)
+    if op0_type == "gdesc":
+        w = set_bits(w, 24, 8, g_a)          # gdesc A at byte 3
+        w = set_bits(w, 32, 8, g_b)          # gdesc B at byte 4
+    else:
+        w = set_bits(w, 24, 8, t_a)          # tmem A at byte 3 (dst)
+        w = set_bits(w, 32, 8, g_b)          # gdesc at byte 4
+    # tmem B at byte 5 (both forms; holds tmemB for gdesc-first, tmemC for
+    # tmem-first because of the text-op re-ordering).
+    w = set_bits(w, 40, 8, t_c if op0_type == "tmem" else t_b)
+    w = set_bits(w, 48, 8, 0xff if op0_type == "tmem" else t_c)
+    w = set_bits(w, 64, 8, t_b if op0_type == "tmem" else t_a)
+    # byte 9: main flag byte; extra imm (e.g. UTCHMMA.2CTA "0x8" tail) is
+    # encoded as (imm << 3) OR'd in.
+    w = set_bits(w, 72, 8, byte9 | ((extra_imm & 0x1f) << 3))
+    # byte 10 flags: 2CTA bit 85, QMMA bit 87.
+    byte10 = 0x00
+    if cta2:
+        byte10 |= 0x20
+    if byte9 == 0x03:
+        byte10 |= 0x80
+    w = set_bits(w, 80, 8, byte10)
+    if omma:
+        w = set_bits(w, 63, 1, 1)
+    # Ps idx at bits 87..89, bit 90 = neg.
+    w = set_bits(w, 87, 3, ps_idx)
+    w = set_bits(w, 90, 1, ps_neg)
+    w = set_bits(w, 91, 1, 1)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCHMMA")
+def enc_utchmma(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x00, cta2=False)
+
+
+@register("UTCHMMA.2CTA")
+def enc_utchmma_2cta(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x00, cta2=True)
+
+
+@register("UTCQMMA")
+def enc_utcqmma(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x03, cta2=False)
+
+
+@register("UTCQMMA.2CTA")
+def enc_utcqmma_2cta(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x03, cta2=True)
+
+
+@register("UTCOMMA.4X")
+def enc_utcomma_4x(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x00, cta2=False, omma=True)
+
+
+@register("UTCOMMA.2CTA.4X")
+def enc_utcomma_2cta_4x(p: ParsedInsn) -> int:
+    return _utc_mma_impl(p, byte9=0x00, cta2=True, omma=True)
+
+
+@register("UTCCP.T.S.2CTA.128dp128bit")
+def enc_utccp_2cta_128dp128bit(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTCCP.128dp arity")
+    ura, off = _parse_tmem(p.operands[0])
+    urb = _parse_gdesc(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x79e7)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 80, 8, 0x38)
+    w = set_bits(w, 88, 8, 0x08)
+    return _apply_pred(w, p.pred)
+
+
+@register("UTCCP.T.S.2CTA.4x32dp128bit")
+def enc_utccp_2cta_t_s_4x32dp128bit(p: ParsedInsn) -> int:
+    if len(p.operands) != 2:
+        raise UnsupportedInstruction("UTCCP.2CTA arity")
+    ura, off = _parse_tmem(p.operands[0])
+    urb = _parse_gdesc(p.operands[1])
+    w = 0
+    w = set_bits(w, 0, 16, 0x79e7)
+    w = set_bits(w, 24, 8, ura)
+    w = set_bits(w, 32, 8, urb)
+    w = set_bits(w, 40, 24, off & ((1 << 24) - 1))
+    w = set_bits(w, 80, 8, 0x30)                # .2CTA flag (bit 85) + 0x10
+    w = set_bits(w, 88, 8, 0x09)
     return _apply_pred(w, p.pred)
 
 
